@@ -1,39 +1,48 @@
 import crypto from "crypto";
 
+const PRIVATE_KEY = process.env.PRIVATE_KEY?.replace(/\\n/g, "\n");
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).send("Method Not Allowed");
   }
 
   try {
-    const PRIVATE_KEY = process.env.PRIVATE_KEY;
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+
+    console.log("body keys:", Object.keys(body));
 
     const {
       encrypted_flow_data,
       encrypted_aes_key,
       initial_vector,
-    } = req.body || {};
+    } = body;
 
     if (!encrypted_flow_data || !encrypted_aes_key || !initial_vector) {
       return res.status(400).send("Missing encrypted payloads");
     }
 
-    // 1) RSA decrypt the AES key
+    const aesKeyCiphertext = Buffer.from(encrypted_aes_key, "base64");
+    const flowCiphertext = Buffer.from(encrypted_flow_data, "base64");
+    const iv = Buffer.from(initial_vector, "base64");
+
+    console.log("decoded lengths:", {
+      encrypted_aes_key: aesKeyCiphertext.length,
+      encrypted_flow_data: flowCiphertext.length,
+      initial_vector: iv.length,
+    });
+
     const aesKey = crypto.privateDecrypt(
       {
         key: PRIVATE_KEY,
         padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
         oaepHash: "sha256",
       },
-      Buffer.from(encrypted_aes_key, "base64")
+      aesKeyCiphertext
     );
 
-    // 2) AES-GCM decrypt the flow payload
-    const iv = Buffer.from(initial_vector, "base64");
-    const encryptedBytes = Buffer.from(encrypted_flow_data, "base64");
-
-    const authTag = encryptedBytes.subarray(encryptedBytes.length - 16);
-    const ciphertext = encryptedBytes.subarray(0, encryptedBytes.length - 16);
+    const authTag = flowCiphertext.subarray(flowCiphertext.length - 16);
+    const ciphertext = flowCiphertext.subarray(0, flowCiphertext.length - 16);
 
     const decipher = crypto.createDecipheriv("aes-128-gcm", aesKey, iv);
     decipher.setAuthTag(authTag);
@@ -44,46 +53,39 @@ export default async function handler(req, res) {
     ]);
 
     const payload = JSON.parse(decrypted.toString("utf8"));
+    console.log("payload:", payload);
 
-    // helper to encrypt all responses back to Meta
     const encryptResponse = (obj) => {
-      const json = JSON.stringify(obj);
+      const responseJson = Buffer.from(JSON.stringify(obj), "utf8");
 
-      const cipher = crypto.createCipheriv("aes-128-gcm", aesKey, iv);
+      // For data_api_version 3.0, Meta says to invert all bits of the request IV for response encryption.
+      const responseIv = Buffer.from(iv.map((b) => (~b) & 0xff));
+
+      const cipher = crypto.createCipheriv("aes-128-gcm", aesKey, responseIv);
       const encrypted = Buffer.concat([
-        cipher.update(json, "utf8"),
+        cipher.update(responseJson),
         cipher.final(),
       ]);
-
       const tag = cipher.getAuthTag();
+
       return Buffer.concat([encrypted, tag]).toString("base64");
     };
 
-    // 3) Health check
     if (payload.action === "ping") {
-      const response = {
-        version: "3.0",
-        data: {
-          status: "active",
-        },
-      };
-
-      return res.status(200).send(encryptResponse(response));
+      return res.status(200).send(
+        encryptResponse({
+          version: "3.0",
+          data: { status: "active" },
+        })
+      );
     }
 
-    // 4) Real request handling
-    console.log("Decrypted payload:", payload);
-
-    // send to Make / GHL here if needed
-
-    const response = {
-      version: "3.0",
-      data: {
-        status: "ok",
-      },
-    };
-
-    return res.status(200).send(encryptResponse(response));
+    return res.status(200).send(
+      encryptResponse({
+        version: "3.0",
+        data: { status: "ok" },
+      })
+    );
   } catch (err) {
     console.error("Decryption Error:", err);
     return res.status(500).send(`Decryption failed: ${err.message}`);
